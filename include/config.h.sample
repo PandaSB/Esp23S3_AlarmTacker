@@ -1,0 +1,13 @@
+#ifndef _CONFIG_H_
+#define _CONFIG_H_
+
+//Config GRPS
+#define CONFIG_GPRS_APN    "orange"
+#define CONFIG_GPRS_USER   "orange"
+#define CONFIG_GPRS_PASSWD "orange"
+
+#define CONFIG_SERVER_ADDR "www.example.com"
+#define CONFIG_SERVER_PORT 80
+#define CONFIG_SERVER_PATH_RECORD "/test/api/v1/record"
+
+#endif // _CONFIG_H_
