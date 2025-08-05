@@ -1,6 +1,10 @@
 #include <Arduino.h>
 #include "hardware.h"
 #include "config.h"
+#include <esp_camera.h>
+#include <FastLED.h>
+
+
 
 #define SerialAT mySerial
 #define SerialMon Serial
@@ -14,6 +18,42 @@
 
 #include <TinyGsmClient.h>
 #include <ArduinoHttpClient.h>
+
+
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sccb_sda = SIOD_GPIO_NUM,
+    .pin_sccb_scl = SIOC_GPIO_NUM,
+
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+
+    //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG, //YUV422,GRAYSCALE,RGB565,JPEG
+    .frame_size = FRAMESIZE_SVGA,    //QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
+    .jpeg_quality = 12,
+    .fb_count = 2,       //When jpeg mode is used, if fb_count more than one, the driver will work in continuous mode.
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    
+};
+
+
+
 
 MyMax17048 max17048;
 MyRGBLed rgbLed;
@@ -38,6 +78,7 @@ const char gprsPass[] = CONFIG_GPRS_PASSWD;
 const char server[]   = CONFIG_SERVER_ADDR;
 const int  port       = CONFIG_SERVER_PORT;
 const char resource_record[] = CONFIG_SERVER_PATH_RECORD;
+const char ressouce_config[] = CONFIG_SERVER_PATH_CONFIG;
 
 
 TinyGsmClient client(modem);
@@ -45,32 +86,54 @@ HttpClient    http(client, server, port);
 //TinyGsmClientSecure client(modem);
 //HttpClient          http(client, server, port);
 
-  bool networkready = false ; 
-  bool datasend = false ; 
-  bool batready = false ; 
-  bool posGPSready = false ; 
-  bool posGSMready = false ;
-  float batvalue = -1; 
-  float lat = 0;
-  float lon = 0;
-  float speed = 0;
-  float alt = 0;
-  float latgsm = 0;
-  float longsm = 0;
-  float accuracy=0;
-  float accuracygsm=0;
-  int loopgps = 0; 
-  int loopdelay = 5;
-  int64_t chipid = 0;
-  uint16_t chip = 0;
-  String Date = ""; 
-  String Time = ""; 
+bool alarmon = false;
+bool alarmstatus = false; 
+bool rebootingissue = false ;
+bool networkready = false ; 
+bool datasend = false ; 
+bool dataread = false ; 
+bool batready = false ; 
+bool posGPSready = false ; 
+bool posGSMready = false ;
+bool deviceGPSready = false ; 
+float batvalue = -1; 
+int loopstartGPS = 0; 
+int loopstartGPRS = 0 ; 
+float lat = 0;
+float lon = 0;
+float speed = 0;
+float alt = 0;
+float latgsm = 0;
+float longsm = 0;
+float accuracy=0;
+float accuracygsm=0;
+int loopgps = 0; 
+int loopdelay = 5;
+int64_t chipid = 0;
+uint16_t chip = 0;
+String Date = ""; 
+String Time = ""; 
 
-  RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR int bootCount = 0;
 
 #define uS_TO_S_FACTOR 1000000ULL 
 #define TIME_TO_SLEEP  60   
-#define TIME_TO_SLEEP_MODEM  30   
+#define TIME_TO_SLEEP_REBOOT  10   
+
+CRGB leds[CONFIG_NUM_LEDS];
+
+static esp_err_t init_camera(void)
+{
+    //initialize the camera
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK)
+    {
+        SerialMon.println( "Camera Init Failed");
+        return err;
+    }
+
+    return ESP_OK;
+}
 
 void print_wakeup_reason() {
   esp_sleep_wakeup_cause_t wakeup_reason;
@@ -86,8 +149,6 @@ void print_wakeup_reason() {
     default:                        Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
   }
 }
-
-
 
 void SentSerial(const char *p_char) {
   for (int i = 0; i < strlen(p_char); i++) {
@@ -155,11 +216,77 @@ uint32_t TinyGsmAutoBaud()
     return 0;
 }
 
+String SendGETMessage (String uri) {
+    
+    http.connectionKeepAlive();  // Currently, this is needed for HTTPS
+
+    int err = http.get(uri);
+    if (err != 0) {
+      SerialMon.println(F("failed to connect"));
+      delay(10000);
+      return ("");
+    }
+
+    int status = http.responseStatusCode();
+    SerialMon.print(F("Response status code: "));
+    SerialMon.println(status);
+    if (!status) {
+      delay(10000);
+      return ("");
+    }
+
+    SerialMon.println(F("Response Headers:"));
+    while (http.headerAvailable()) {
+      String headerName  = http.readHeaderName();
+      String headerValue = http.readHeaderValue();
+      SerialMon.println("    " + headerName + " : " + headerValue);
+    }
+
+    int length = http.contentLength();
+    if (length >= 0) {
+      SerialMon.print(F("Content length is: "));
+      SerialMon.println(length);
+    }
+    if (http.isResponseChunked()) {
+      SerialMon.println(F("The response is chunked"));
+    }
+
+    String body = http.responseBody();
+    SerialMon.println(F("Response:"));
+    SerialMon.println(body);
+
+    SerialMon.print(F("Body length is: "));
+    SerialMon.println(body.length());
+
+    return (body);
+
+}
+
+String  SendPOSTMessage (String uri , String contentType , String data) 
+{
+    http.connectionKeepAlive();  // Currently, this is needed for HTTPS
+    http.post(uri, contentType, data);
+
+    // read the status code and body of the response
+    int statusCode = http.responseStatusCode();
+    String response = http.responseBody();
+
+    Serial.print("Status code: ");
+    Serial.println(statusCode);
+    Serial.print("Response: ");
+    Serial.println(response);
+    return response ; 
+
+}
 
 
 void setup() {
-  int loopstartGPS = 0 ; 
-  bool modemstatusfail = false ; 
+
+  
+  FastLED.addLeds<WS2812B, CONFIG_DATA_PIN, RGB>(leds, CONFIG_NUM_LEDS); 
+  leds[0] = CRGB::Red;
+  FastLED.show();
+
   Serial.begin(115200);
   while (!Serial) {
       ; // wait for serial port to connect. Needed for native USB port only
@@ -168,10 +295,10 @@ void setup() {
 
   bootCount ++;
 
-  pinMode(33, OUTPUT);
-  digitalWrite(33, LOW);
+  pinMode(CONFIG_MODEM_PWR, OUTPUT);
+  digitalWrite(CONFIG_MODEM_PWR, LOW);
   delay (1000);
-  digitalWrite(33, HIGH);
+  digitalWrite(CONFIG_MODEM_PWR, HIGH);
 
   SerialAT.begin(115200,SERIAL_8N1, 17,  18 ); 
   SerialMon.println("Boot number: " + String(bootCount));
@@ -184,18 +311,11 @@ void setup() {
   SerialMon.print("Modem Info: ");
   SerialMon.println(modemInfo);
 
-  while((modemstatusfail = !modem.enableGPS()) && (loopstartGPS < 3))
-  {
-    loopstartGPS++; 
-  }
-  if (modemstatusfail )
-  {
-      SerialMon.println ("Modem not start , Switch in sleep ");
-      esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_MODEM * uS_TO_S_FACTOR);
-      SerialMon.flush();
-      esp_deep_sleep_start();
+  init_camera();
+  camera_fb_t *pic = esp_camera_fb_get();
+  leds[0] = CRGB::Yellow;
+  FastLED.show();
 
-  }
 
 
 
@@ -204,30 +324,52 @@ void setup() {
 void loop() {
 
   if (!networkready) {
+    SerialMon.println("Connect to GPRS");
     modem.gprsConnect(apn, gprsUser, gprsPass);
 
     SerialMon.print("Waiting for network...");
     if (!modem.waitForNetwork()) {
       SerialMon.println(" fail");
-      delay(10000);
+      delay(2000);
+      loopstartGPRS ++ ; 
+      networkready = false ; 
+      if (loopstartGPRS > 10 ) {
+        rebootingissue = true ; 
+      }
       return;
     }
     SerialMon.println(" success");
-    if (modem.isNetworkConnected()) 
-    { 
-      SerialMon.println("Network connected"); 
-      networkready = true;
-    }
+    networkready = true; 
+    return; 
+
   }
   
   if (!batready) {
+    SerialMon.println("Read Battery Value");
+
     batvalue = max17048.getBatteryLevel();
     batready = true; 
     chipid = ESP.getEfuseMac(); // The chip ID is essentially its MAC address(length: 6 bytes).
     chip = (uint16_t)(chipid >> 32);
   }
 
-  if (!posGPSready) {
+  if (!deviceGPSready) {
+    SerialMon.println("Enable GPS device");
+    if (!modem.enableGPS() ) loopstartGPS++; 
+    else  deviceGPSready = true ;
+    
+    if (loopstartGPS > 3)
+    {
+      deviceGPSready = true ;
+      rebootingissue = true ; 
+    } 
+    leds[0] = CRGB::Blue;
+    FastLED.show();
+  }
+
+  if ((!posGPSready) && (deviceGPSready)){
+    SerialMon.println("Enable GPS position");
+
     SerialMon.print(F("GNSS raw info: "));
     SerialMon.println(modem.getGPSraw());
     SerialMon.print(F("GNSS info: "));
@@ -259,82 +401,51 @@ void loop() {
     } 
   }
 
+  if (!dataread && networkready )
+  {
+    String data = ""; 
+    String uri = ""; 
+    String Answer = ""; 
+    char szchipid[9];
 
+    SerialMon.println ("Receive config from server ");
+    leds[0] = CRGB::Orange;
+    FastLED.show();
+    itoa(chipid, szchipid, 16);
+    data = "chipid=" + String(szchipid);
+
+    Serial.println("making POST request");
+    Answer = SendPOSTMessage (String (ressouce_config) , "application/x-www-form-urlencoded" , data) ; 
+
+    SerialMon.print ("config answer : ") ; Serial.println (Answer) ; 
+     dataread = true; 
+  }
 
   if (networkready && batready && posGPSready && posGSMready && !datasend  ){
     String data = ""; 
     String uri = ""; 
-
     char szchipid[9];
+
+    SerialMon.println("Send Data to GPRS");
+
     itoa(chipid, szchipid, 16);
-
-    http.connectionKeepAlive();  // Currently, this is needed for HTTPS
-    data = "chipid=" + String(szchipid) + "&date=" + Date + "&time=" + Time + "&bat=" + String(batvalue,9) + "&lat=" + String(lat,9) + "&lon=" + String(lon,9) + "&speed=" + String (speed,9) +"&accuracy=" + String(accuracy,9) + "&longsm=" + String(longsm,9) + "&latgsm=" + String(latgsm,9) + "&accuracygsm=" + String(accuracygsm,9) ; 
+    leds[0] = CRGB::Green;
+    FastLED.show();
+    data = "chipid=" + String(szchipid) + "&date=" + Date + "&time=" + Time + "&bat=" + String(batvalue,9) + "&lat=" + String(lat,9) + "&lon=" + String(lon,9) + "&speed=" + String (speed,9) +"&accuracy=" + String(accuracy,9) + "&longsm=" + String(longsm,9) + "&latgsm=" + String(latgsm,9) + "&accuracygsm=" + String(accuracygsm,9) + "&alarmon=" + String(alarmon) + "&alarmstatus=" + String(alarmstatus) ; 
 #if 0
+    Serial.println("making GET request");    
     uri = resource_record + String("?") + data ; 
-    
-    SerialMon.print(F("Performing HTTPS GET request... "));
-    int err = http.get(uri);
-    if (err != 0) {
-      SerialMon.println(F("failed to connect"));
-      delay(10000);
-      return;
-    }
+    SendGETMessage ( uri) ; 
 
-    int status = http.responseStatusCode();
-    SerialMon.print(F("Response status code: "));
-    SerialMon.println(status);
-    if (!status) {
-      delay(10000);
-      return;
-    }
-
-    SerialMon.println(F("Response Headers:"));
-    while (http.headerAvailable()) {
-      String headerName  = http.readHeaderName();
-      String headerValue = http.readHeaderValue();
-      SerialMon.println("    " + headerName + " : " + headerValue);
-    }
-
-    int length = http.contentLength();
-    if (length >= 0) {
-      SerialMon.print(F("Content length is: "));
-      SerialMon.println(length);
-    }
-    if (http.isResponseChunked()) {
-      SerialMon.println(F("The response is chunked"));
-    }
-
-    String body = http.responseBody();
-    SerialMon.println(F("Response:"));
-    SerialMon.println(body);
-
-    SerialMon.print(F("Body length is: "));
-    SerialMon.println(body.length());
 #endif 
 
     Serial.println("making POST request");
-    String contentType = "application/x-www-form-urlencoded";
-
-    uri = resource_record ; 
-    http.post(uri, contentType, data);
-
-    // read the status code and body of the response
-    int statusCode = http.responseStatusCode();
-    String response = http.responseBody();
-
-    Serial.print("Status code: ");
-    Serial.println(statusCode);
-    Serial.print("Response: ");
-    Serial.println(response);
-
-
-
+    SendPOSTMessage (String (resource_record) , "application/x-www-form-urlencoded" , data) ; 
 
     datasend = true ; 
   }
 
-  if (datasend) {
+  if (datasend && dataread) {
     /*
     if (SerialAT.available()) {
       char buf ; 
@@ -344,10 +455,38 @@ void loop() {
       char buf ; 
       SerialAT.write(SerialMon.read());
     }
-  */      
+  */
+    leds[0] = CRGB::Black;
+    FastLED.show();      
     SerialMon.println("Switch in sleep mode") ; 
     SerialMon.flush();
     esp_deep_sleep_start();
+  }
+
+  if (rebootingissue) {
+    SerialMon.println("Issue need reboot") ; 
+    SerialMon.flush();
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP_REBOOT * uS_TO_S_FACTOR);
+    esp_deep_sleep_start();
+  }
+
+  delay(1000) ; 
+  SerialMon.println("Status : ") ; 
+  SerialMon.print (" - deviceGPSready") ; SerialMon.println (deviceGPSready) ; 
+  SerialMon.print (" - batready") ; SerialMon.println (batready) ; 
+  SerialMon.print (" - networkready") ; SerialMon.println (networkready) ; 
+  SerialMon.print (" - posGPSready") ; SerialMon.println (posGPSready) ; 
+  SerialMon.print (" - posGSMready") ; SerialMon.println (posGSMready) ; 
+  SerialMon.print (" - datasend") ; SerialMon.println (datasend) ; 
+  SerialMon.print (" - dataread") ; SerialMon.println (dataread) ; 
+
+  if (SerialMon.available()) {
+    char buf = SerialMon.read();
+    if (buf == 'r') {
+      esp_sleep_enable_timer_wakeup(1 * uS_TO_S_FACTOR);
+      esp_deep_sleep_start();     
+    }
+
   }
 
 }
