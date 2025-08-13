@@ -25,7 +25,10 @@
 #define CONFIG_DATA_PIN   38
 #define CONFIG_NUM_LEDS   1
 
-
+#define CONFIG_SDMMC_CLK  5
+#define CONFIG_SDMMC_CMD  4
+#define CONFIG_SDMMC_DATA 6
+#define CONFIG_SDMMC_CD   46
 
 class MyMax17048 {
 
