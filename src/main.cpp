@@ -18,7 +18,7 @@
 #if !defined(TINY_GSM_RX_BUFFER)
 #define TINY_GSM_RX_BUFFER 1024
 #endif
-#define DUMP_AT_COMMANDS
+//#define DUMP_AT_COMMANDS
 //#define TINY_GSM_DEBUG 
 
 #include <TinyGsmClient.h>
@@ -94,7 +94,6 @@ TinyGsmClient client(modem);
 //TinyGsmClientSecure client(modem);
 //HttpClient          http(client, server, port);
 
-bool alarmon = false;
 bool alarmstatus = false; 
 bool rebootingissue = false ;
 bool networkready = false ; 
@@ -131,7 +130,6 @@ int config_delay = CONFIG_DEFAULT_DELAY ;
 RTC_DATA_ATTR int bootCount = 0;
 
 #define uS_TO_S_FACTOR 1000000ULL 
-#define TIME_TO_SLEEP  10   
 #define TIME_TO_SLEEP_REBOOT  10   
 
 CRGB leds[CONFIG_NUM_LEDS];
@@ -505,16 +503,23 @@ bool testFile(fs::FS &fs, const char * path){
     return (present);
 }
 
+void IRAM_ATTR change_vibrationsensor() { 
+  alarmstatus = true ; 
+}
+
 void setup() {
     char configbuffer[300] = {0} ; 
     FastLED.addLeds<WS2812B, CONFIG_DATA_PIN, RGB>(leds, CONFIG_NUM_LEDS); 
-    leds[0] = CRGB::Red;
+    leds[0] = CRGB::Black;
     FastLED.show();
 
     SerialMon.begin(115200);
     while (!Serial) {
         ; // wait for serial port to connect. Needed for native USB port only
     }  
+
+    pinMode(VIBRATOR_PIN, INPUT) ; 
+    attachInterrupt(VIBRATOR_PIN, change_vibrationsensor, CHANGE);
         
     pinMode(SD_CD_PIN, OUTPUT);
     digitalWrite(SD_CD_PIN,LOW) ; 
@@ -568,8 +573,8 @@ void setup() {
 
     init_camera();
 
-    leds[0] = CRGB::Yellow;
-    FastLED.show();
+    //leds[0] = CRGB::Yellow;
+    //FastLED.show();
     
     if (!testFile (SD_MMC,"/config.txt")) {
 
@@ -585,9 +590,26 @@ void setup() {
         SerialMon.println(JSONmessageBuffer);
         writeFile(SD_MMC, "/config.txt", JSONmessageBuffer.c_str());
     }
-    readFile(SD_MMC, "/config.txt",configbuffer) ; 
-    SerialMon.println (configbuffer) ; 
+    readFile(SD_MMC, "/config.txt",configbuffer);
+    if (strlen(configbuffer) > 0) {
+      JsonDocument doc;
 
+      SerialMon.println (configbuffer) ; 
+      DeserializationError error =  deserializeJson(doc, configbuffer);
+      if (!error ) {
+        config_alarmstate = doc["alarmon"];
+        config_sms = doc["SMS"].as<String>();
+        config_smsc = doc["SMSC"].as<String>();
+        config_delay = doc["delay"]; 
+      }
+    }
+
+    if (bootCount == 1) {
+        if (config_sms.length() > 0 )
+          modem.sendSMS (config_sms, "Alarm reboot") ;
+    }
+
+    
 
 }
 
@@ -633,8 +655,8 @@ void loop() {
       deviceGPSready = true ;
       rebootingissue = true ; 
     } 
-    leds[0] = CRGB::Blue;
-    FastLED.show();
+  //  leds[0] = CRGB::Blue;
+  //  FastLED.show();
   }
 
   if ((!posGPSready) && (deviceGPSready)){
@@ -681,8 +703,8 @@ void loop() {
     char szchipid[9];
 
     SerialMon.println ("Receive config from server ");
-    leds[0] = CRGB::Orange;
-    FastLED.show();
+    //leds[0] = CRGB::Orange;
+    //FastLED.show();
     itoa(chipid, szchipid, 16);
     data = "chipid=" + String(szchipid);
 
@@ -696,26 +718,24 @@ void loop() {
       SerialMon.println(error.c_str());
     } else
     {
-        int id = doc["id"];
-        const char* chipid = doc["chipid"];
-        int alarmon = doc["alarmon"];
-        const char* SMS = doc["SMS"];
-        const char* SMSC = doc["SMSC"];
-        int delay = doc["delay"];
+        JsonDocument configdoc;
+        String  JSONmessageBuffer = "" ; 
 
-        SerialMon.printf ("id : %d - chipid : %s  - alarmon : %d  - SMS : %s - SMSC : %s\r\n ", id , chipid , alarmon , SMS, SMSC, delay) ; 
+        SerialMon.printf ("Update configuration file : config_alarmstate : %d - config_sms : %s - config_smsc : %s - config_delay : %d \r\n",config_alarmstate, config_sms, config_smsc , config_delay  ) ; 
+        config_alarmstate = doc["alarmon"];
+        config_sms = doc["SMS"].as<String>();
+        config_smsc = doc["SMSC"].as<String>();
+        config_delay = doc["delay"];
+
 
         /*Save configuration to file */
 
-        JsonDocument doc;
-        String  JSONmessageBuffer = "" ; 
-
-
-        doc["alarmon"] = config_alarmstate;
-        doc["SMS"] = config_sms;
-        doc["SMSC"] = config_smsc;
-        doc["delay"] = config_delay;
-        serializeJson(doc, JSONmessageBuffer);
+        configdoc["alarmon"] = config_alarmstate;
+        configdoc["SMS"] = config_sms;
+        configdoc["SMSC"] = config_smsc;
+        configdoc["delay"] = config_delay;
+        serializeJson(configdoc, JSONmessageBuffer);
+        SerialMon.print ("Save configuration to file : ") ; 
         SerialMon.println(JSONmessageBuffer);
         writeFile(SD_MMC, "/config.txt", JSONmessageBuffer.c_str());
     }
@@ -735,9 +755,9 @@ void loop() {
     SerialMon.println("Send Data to GPRS");
 
     itoa(chipid, szchipid, 16);
-    leds[0] = CRGB::Green;
-    FastLED.show();
-    data = "chipid=" + String(szchipid) + "&date=" + Date + "&time=" + Time + "&bat=" + String(batvalue,9) + "&lat=" + String(lat,9) + "&lon=" + String(lon,9) + "&speed=" + String (speed,9) +"&accuracy=" + String(accuracy,9) + "&longsm=" + String(longsm,9) + "&latgsm=" + String(latgsm,9) + "&accuracygsm=" + String(accuracygsm,9) + "&alarmon=" + String(alarmon) + "&alarmstatus=" + String(alarmstatus)  ; 
+    //leds[0] = CRGB::Green;
+    //FastLED.show();
+    data = "chipid=" + String(szchipid) + "&date=" + Date + "&time=" + Time + "&bat=" + String(batvalue,9) + "&lat=" + String(lat,9) + "&lon=" + String(lon,9) + "&speed=" + String (speed,9) +"&accuracy=" + String(accuracy,9) + "&longsm=" + String(longsm,9) + "&latgsm=" + String(latgsm,9) + "&accuracygsm=" + String(accuracygsm,9) + "&alarmon=" + String(config_alarmstate) + "&alarmstatus=" + String(alarmstatus)  ; 
 
     SerialMon.println("making POST request");
     SendPOSTMessage (String (resource_record) , "application/x-www-form-urlencoded" , data) ; 

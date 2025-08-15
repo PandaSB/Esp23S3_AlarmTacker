@@ -30,6 +30,9 @@
 #define CONFIG_SDMMC_DATA 6
 #define CONFIG_SDMMC_CD   46
 
+
+#define VIBRATOR_PIN 21 
+
 class MyMax17048 {
 
 public:
